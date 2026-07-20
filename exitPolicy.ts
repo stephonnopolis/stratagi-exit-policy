@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// @stratagi/exit-policy — SHARED single-source exit-decision lib (v1.0.0)
+// @stratagi/exit-policy — SHARED single-source exit-decision lib (v1.0.1)
 //
 // This is the ONE source of exit-decision logic, imported by BOTH the live
 // autotrader (posmanage loop) AND the signal-worker backtest, so a backtest with
@@ -35,6 +35,12 @@ export interface ManagedPosition {
   takeProfit: number | null;
   volume: number;
   profit: number | null;   // unrealized, account currency (from the position read)
+  // Pip size source (Chat B's table-driven design): the symbol's pip_decimal_places
+  // from the symbol row. pip size = 10 ** -pipDecimalPlaces. Both live and backtest
+  // supply this per-symbol so no ticker can be missed when the symbol table changes.
+  // Optional: if absent, ruleTrailing falls back to pipSizeFor(symbol) (the 8
+  // production symbols, format-tolerant). Prefer supplying this.
+  pipDecimalPlaces?: number | null;
   // A3 R-metric inputs — the SIGNAL's ORIGINAL entry/stop (from the position→
   // signal join), NOT the live position stop (which A1/A2 move). Populated by the
   // loop before the rule pass; null if the join found no signal (A3 skips → safe).
@@ -155,21 +161,50 @@ export function ruleMoveSlOnTp(
 // worker's pip_decimal_places (the source of truth) before A2 trades any symbol
 // for real. A drift here = a mis-sized trail. FAIL-SAFE: a symbol with no pip
 // size returns null → A2 SKIPS it (no trail), never guesses.
-const PIP_SIZE_BY_BROKER_SYMBOL: Record<string, number> = {
-  XAUUSD: 0.1,     // gold: 1 pip = 0.1
-  EURUSD: 0.0001,  // USD majors: 1 pip = 0.0001
-  GBPUSD: 0.0001,
-  AUDUSD: 0.0001,
-  NZDUSD: 0.0001,
-  USDJPY: 0.01,    // JPY pairs: 1 pip = 0.01
-  GBPJPY: 0.01,
-  EURJPY: 0.01,
-  // BTCUSD intentionally absent (not mapped/traded) → fail-safe skip.
+// Pip size = 10 ** -pip_decimal_places. TABLE-DRIVEN is the robust design (Chat B):
+// the symbol table changes (forex went validating→production, BTC deprecated), so a
+// hardcoded ticker list silently breaks. PRIMARY: pipSizeForDp(dp) with the symbol's
+// pip_decimal_places passed in (from the symbol row) — no ticker can be missed.
+// FALLBACK: pipSizeFor(symbol), format-tolerant, correct for the 8 production symbols
+// as a safety net when dp isn't supplied.
+//
+// ⚠️ THREE DISTINCT SCALES — do NOT assume "forex = 4dp": the JPY pairs are 2dp.
+//   XAU/USD      1dp → 0.1
+//   USD-majors   4dp → 0.0001   (EUR/USD, GBP/USD, AUD/USD, NZD/USD)
+//   JPY pairs    2dp → 0.01     (USD/JPY, GBP/JPY, EUR/JPY)
+// Values equal 10^-pip_decimal_places from the signal worker's symbol table, so
+// backtest pip math matches how signals actually resolved (pip-reconcile gate).
+
+// PRIMARY — table-driven: pass the symbol's pip_decimal_places, get its pip size.
+// Uses 1/10^dp (not Math.pow(10,-dp)) — the latter yields float artifacts like
+// 0.00009999999999999999 for dp=4. Division by an integer power of 10 is exact for
+// the dp values we use (0-5).
+export function pipSizeForDp(pipDecimalPlaces: number | null | undefined): number | null {
+  if (pipDecimalPlaces == null || !Number.isInteger(pipDecimalPlaces) || pipDecimalPlaces < 0) return null;
+  return 1 / Math.pow(10, pipDecimalPlaces);
+}
+
+// FALLBACK — hardcoded lookup, FORMAT-TOLERANT (strips '/' + uppercases, so both
+// 'EUR/USD' and 'EURUSD' resolve). Correct dp per the three scales. Safety net when
+// pipDecimalPlaces isn't supplied; prefer pipSizeForDp.
+const PIP_DP_BY_SYMBOL: Record<string, number> = {
+  // production (8)
+  XAUUSD: 1,                                    // gold 1dp → 0.1
+  EURUSD: 4, GBPUSD: 4, AUDUSD: 4, NZDUSD: 4,   // USD majors 4dp → 0.0001
+  USDJPY: 2, GBPJPY: 2, EURJPY: 2,              // JPY pairs 2dp → 0.01 (NOT 4dp — the trap)
+  // deprecated (cheap to include; fail-safe if a stale ref appears)
+  BTCUSD: 0,                                    // BTC 0dp → 1 (1 pip = $1)
+  DIA: 2, TSLA: 2,                              // stocks 2dp
 };
 
-// Price value of one pip for a broker symbol, or null if unknown (→ A2 skips).
-export function pipSizeFor(brokerSymbol: string): number | null {
-  return PIP_SIZE_BY_BROKER_SYMBOL[brokerSymbol] ?? null;
+function normalizeSymbol(s: string): string {
+  return s.replace(/\//g, '').toUpperCase();
+}
+
+// Price value of one pip for a symbol (format-tolerant), or null if unknown (→ A2 skips).
+export function pipSizeFor(symbol: string): number | null {
+  const dp = PIP_DP_BY_SYMBOL[normalizeSymbol(symbol)];
+  return dp == null ? null : 1 / Math.pow(10, dp);
 }
 
 // ── A2 — TRAILING STOP ───────────────────────────────────────────────────────
@@ -196,7 +231,10 @@ export function ruleTrailing(
   if (cfg.trailingDistance == null || cfg.trailingDistance <= 0) {
     return { kind: 'none', reason: 'no trail distance set', rule };
   }
-  const pipSize = pipSizeFor(pos.symbol);
+  // Table-driven pip size (Chat B): prefer the per-symbol pip_decimal_places
+  // supplied on the position (from the symbol row); fall back to the format-
+  // tolerant symbol lookup. Either way, unknown → null → skip (fail-safe).
+  const pipSize = pipSizeForDp(pos.pipDecimalPlaces) ?? pipSizeFor(pos.symbol);
   if (pipSize === null) {
     return { kind: 'none', reason: `no pip size for ${pos.symbol} — skip (fail-safe)`, rule };
   }
