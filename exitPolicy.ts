@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// @stratagi/exit-policy — SHARED single-source exit-decision lib (v1.0.1)
+// @stratagi/exit-policy — SHARED single-source exit-decision lib (v1.1.0)
 //
 // This is the ONE source of exit-decision logic, imported by BOTH the live
 // autotrader (posmanage loop) AND the signal-worker backtest, so a backtest with
@@ -46,6 +46,14 @@ export interface ManagedPosition {
   // loop before the rule pass; null if the join found no signal (A3 skips → safe).
   originalEntry?: number | null;
   originalStop?: number | null;
+  // Staged multi-TP inputs — the signal's TP ladder (TP1/TP2/TP3, from the signal
+  // row: 1.5R/2.0R/3.0R). Live: from the position→signal join (same hop as
+  // originalEntry/Stop). Backtest: from the signal row directly. Needed by
+  // evaluateStagedTp to detect TP crossings + compute stop actions. Null → the
+  // staged fn treats that TP level as absent (skips the stage — fail-safe).
+  tp1?: number | null;
+  tp2?: number | null;
+  tp3?: number | null;
 }
 
 // Per-account exit-management config (the feature flags + params + modes).
@@ -447,4 +455,212 @@ export function slWouldTighten(
   if (currentSl === null) return true;
   if (type === 'POSITION_TYPE_BUY') return proposedSl >= currentSl;
   return proposedSl <= currentSl;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// STAGED MULTI-TP — evaluateStagedTp (v1.1.0, Phase 2)
+//
+// A signal has TP1/TP2/TP3 (the 1.5R/2.0R/3.0R ladder). Staged management adds an
+// active decision at each TP: as price reaches each level the position CLOSES
+// (credited there) or CONTINUES toward the next TP with a STOP ACTION (protect/
+// advance the stop). Gated tree: TP2 only if TP1 continued; TP3 only if TP2
+// continued. TP3 is the ceiling — close or convert to a trailing stop (no TP4).
+// One position, closes whole (no partials).
+//
+// PURE — no I/O. Reuses the trailing math + never-loosen (slWouldTighten) as the
+// per-stage executors; does NOT rewrite exit math. Both backtest (now) and the
+// live autotrader (deferred Phase 5, granularity gap) call this identically.
+//
+// Design: STAGED_TP_DESIGN.md (LOCKED 2026-07-21).
+// ═════════════════════════════════════════════════════════════════════════════
+
+// A stop action fires on CONTINUE at TP1/TP2 (protect/advance the stop).
+export type StopAction =
+  | { kind: 'breakeven' }                          // SL → entry (openPrice)
+  | { kind: 'move_to_prior_tp' }                   // SL → the TP just hit
+  | { kind: 'pip_offset'; behindTp: number }       // SL → N pips behind the TP just hit
+  | { kind: 'trail'; distancePips: number };        // SL → trailing at N pips (from current price)
+
+export interface StagedTpConfig {
+  enabled: boolean;                                // off = today's passive behavior
+  tp1: { onHit: 'close' | 'continue'; stopAction: StopAction | null };
+  tp2: { onHit: 'close' | 'continue'; stopAction: StopAction | null }; // only if tp1 continued
+  tp3: { onHit: 'close' | 'trail'; trailDistancePips: number | null }; // only if tp2 continued
+}
+
+// Monotonic stage — only advances (mirrors the resolver's monotonic tp_hit).
+//   pre_tp1 → past_tp1 → past_tp2 → past_tp3_trailing ; or → closed at any level.
+export type StagedTpStage =
+  | 'pre_tp1'
+  | 'past_tp1'
+  | 'past_tp2'
+  | 'past_tp3_trailing'
+  | 'closed';
+
+export interface StagedTpState {
+  stage: StagedTpStage;
+}
+
+// Stage rank for the monotonic guard (only advance).
+const STAGE_RANK: Record<StagedTpStage, number> = {
+  pre_tp1: 0, past_tp1: 1, past_tp2: 2, past_tp3_trailing: 3, closed: 4,
+};
+
+// Has price reached a TP level? Direction-aware (BUY reads bid up to TP; SELL reads
+// ask down to TP). Pessimistic bias belongs to the CALLER (backtest passes the bar
+// extreme; live passes the tick) — this just compares the passed price to the level.
+function reachedTp(type: ManagedPosition['type'], price: PriceSnapshot, tp: number): boolean {
+  return type === 'POSITION_TYPE_BUY' ? price.bid >= tp : price.ask <= tp;
+}
+
+// Compute the SL a StopAction wants, given the TP just hit. Returns a target SL
+// price (subject to never-loosen by the caller/this fn), or null if not computable.
+function stopActionTarget(
+  action: StopAction,
+  pos: ManagedPosition,
+  price: PriceSnapshot,
+  tpJustHit: number,
+  priorTp: number | null,   // the TP one level BELOW the one just hit (for move_to_prior_tp); null at TP1
+): { to: number | null; note: string } {
+  switch (action.kind) {
+    case 'breakeven':
+      return { to: pos.openPrice, note: `breakeven (SL→entry ${pos.openPrice})` };
+    case 'move_to_prior_tp':
+      // Move SL to the PRIOR TP level (per Example A: at TP2 → SL to TP1). At TP1
+      // there is no prior TP → fall back to breakeven (SL→entry), the safe floor.
+      if (priorTp == null) {
+        return { to: pos.openPrice, note: `move_to_prior_tp at TP1 (no prior) → breakeven ${pos.openPrice}` };
+      }
+      return { to: priorTp, note: `move_to_prior_tp (SL→prior TP ${priorTp})` };
+    case 'pip_offset': {
+      const pipSize = pipSizeForDp(pos.pipDecimalPlaces) ?? pipSizeFor(pos.symbol);
+      if (pipSize === null) return { to: null, note: `pip_offset: no pip size for ${pos.symbol} — skip` };
+      // N pips BEHIND the TP just hit: BUY → below the TP; SELL → above the TP.
+      const offset = action.behindTp * pipSize;
+      const to = pos.type === 'POSITION_TYPE_BUY' ? tpJustHit - offset : tpJustHit + offset;
+      return { to, note: `pip_offset(${action.behindTp} behind TP ${tpJustHit}) → SL ${to.toFixed(5)}` };
+    }
+    case 'trail': {
+      const pipSize = pipSizeForDp(pos.pipDecimalPlaces) ?? pipSizeFor(pos.symbol);
+      if (pipSize === null) return { to: null, note: `trail: no pip size for ${pos.symbol} — skip` };
+      const dist = action.distancePips * pipSize;
+      const to = pos.type === 'POSITION_TYPE_BUY' ? price.bid - dist : price.ask + dist;
+      return { to, note: `trail(${action.distancePips}p) → SL ${to.toFixed(5)}` };
+    }
+  }
+}
+
+// Build a modify_sl Action from a StopAction target, enforcing never-loosen. If the
+// target is null (uncomputable) or would loosen, returns a 'none' (no stop change)
+// but the stage still advances (the CONTINUE decision stands; only the stop move is
+// skipped). rule tag identifies the stage.
+function stagedSlAction(
+  target: { to: number | null; note: string },
+  pos: ManagedPosition,
+  rule: string,
+): Action {
+  if (target.to === null) {
+    return { kind: 'none', reason: `staged ${target.note}`, rule };
+  }
+  if (!slWouldTighten(pos.type, pos.stopLoss, target.to)) {
+    return { kind: 'none', reason: `staged stop ${target.note} would loosen (SL ${pos.stopLoss}) — hold (never-loosen)`, rule };
+  }
+  return { kind: 'modify_sl', to: target.to, reason: `staged ${target.note}`, rule };
+}
+
+// The staged decision. Given the position (with tp1/2/3), current price, the
+// persisted stage, and the config → returns the Action to execute this evaluation
+// AND the newStage to persist. PURE. The caller persists newStage BEFORE acting
+// (crash-safe, like A4's fire-once) and applies the Action (modify_sl/close/none).
+//
+// CONTRACT:
+// - enabled=false → { none, stage unchanged } (passive behavior).
+// - Detects the FURTHEST TP reached that the stage hasn't passed yet, applies that
+//   level's decision, advances stage by ONE level per call (monotonic). If price
+//   has blown through multiple TPs in one gap, successive calls advance one each;
+//   the caller loops until stage stabilizes if it wants same-tick multi-advance.
+// - close → { close, newStage:'closed' }. continue → { the stopAction's modify_sl
+//   (or none), newStage advanced }. TP3 trail → { modify_sl trailing, past_tp3_trailing }.
+// - Past TP3 (past_tp3_trailing): keep trailing at tp3.trailDistancePips each call.
+// - Never-loosen enforced on every stop move. Null TP level → that stage inert.
+export function evaluateStagedTp(
+  pos: ManagedPosition,
+  price: PriceSnapshot,
+  stageState: StagedTpState,
+  config: StagedTpConfig,
+): { action: Action; newStage: StagedTpStage } {
+  const ruleBase = 'staged_tp';
+  const stage = stageState.stage;
+
+  if (!config.enabled) {
+    return { action: { kind: 'none', reason: 'staged-TP disabled (passive)', rule: ruleBase }, newStage: stage };
+  }
+  if (stage === 'closed') {
+    return { action: { kind: 'none', reason: 'already closed', rule: ruleBase }, newStage: 'closed' };
+  }
+
+  const rank = STAGE_RANK[stage];
+
+  // ── Stage transitions, evaluated in order; advance ONE level per call. ──
+
+  // pre_tp1 → TP1 reached?
+  if (rank < STAGE_RANK['past_tp1'] && pos.tp1 != null && reachedTp(pos.type, price, pos.tp1)) {
+    const rule = `${ruleBase}:tp1`;
+    if (config.tp1.onHit === 'close') {
+      return { action: { kind: 'close', reason: 'TP1 hit → close (staged)', rule }, newStage: 'closed' };
+    }
+    // continue + optional stop action
+    const act = config.tp1.stopAction
+      ? stagedSlAction(stopActionTarget(config.tp1.stopAction, pos, price, pos.tp1, null), pos, rule)
+      : { kind: 'none' as const, reason: 'TP1 continue, no stop action', rule };
+    return { action: act, newStage: 'past_tp1' };
+  }
+
+  // past_tp1 → TP2 reached? (only consulted because we're past TP1 = tp1 continued)
+  if (rank < STAGE_RANK['past_tp2'] && rank >= STAGE_RANK['past_tp1'] &&
+      pos.tp2 != null && reachedTp(pos.type, price, pos.tp2)) {
+    const rule = `${ruleBase}:tp2`;
+    if (config.tp2.onHit === 'close') {
+      return { action: { kind: 'close', reason: 'TP2 hit → close (staged)', rule }, newStage: 'closed' };
+    }
+    const act = config.tp2.stopAction
+      ? stagedSlAction(stopActionTarget(config.tp2.stopAction, pos, price, pos.tp2, pos.tp1 ?? null), pos, rule)
+      : { kind: 'none' as const, reason: 'TP2 continue, no stop action', rule };
+    return { action: act, newStage: 'past_tp2' };
+  }
+
+  // past_tp2 → TP3 reached? (ceiling: close or convert to trailing)
+  if (rank < STAGE_RANK['past_tp3_trailing'] && rank >= STAGE_RANK['past_tp2'] &&
+      pos.tp3 != null && reachedTp(pos.type, price, pos.tp3)) {
+    const rule = `${ruleBase}:tp3`;
+    if (config.tp3.onHit === 'close') {
+      return { action: { kind: 'close', reason: 'TP3 hit → close (staged, ceiling)', rule }, newStage: 'closed' };
+    }
+    // trail beyond TP3 — requires a user-entered distance.
+    if (config.tp3.trailDistancePips == null || config.tp3.trailDistancePips <= 0) {
+      // No valid trail distance → advance to trailing stage but no stop move.
+      return { action: { kind: 'none', reason: 'TP3 trail: no trail distance set — advance, no move', rule }, newStage: 'past_tp3_trailing' };
+    }
+    const act = stagedSlAction(
+      stopActionTarget({ kind: 'trail', distancePips: config.tp3.trailDistancePips }, pos, price, pos.tp3, pos.tp2 ?? null),
+      pos, rule,
+    );
+    return { action: act, newStage: 'past_tp3_trailing' };
+  }
+
+  // Already past TP3 → keep trailing at the ceiling distance each call.
+  if (stage === 'past_tp3_trailing') {
+    const rule = `${ruleBase}:tp3_trail`;
+    if (config.tp3.onHit === 'trail' && config.tp3.trailDistancePips != null && config.tp3.trailDistancePips > 0) {
+      const act = stagedSlAction(
+        stopActionTarget({ kind: 'trail', distancePips: config.tp3.trailDistancePips }, pos, price, pos.tp3 ?? pos.openPrice, pos.tp2 ?? null),
+        pos, rule,
+      );
+      return { action: act, newStage: 'past_tp3_trailing' };
+    }
+    return { action: { kind: 'none', reason: 'past TP3, no trailing configured', rule }, newStage: 'past_tp3_trailing' };
+  }
+
+  // No TP crossing this evaluation — hold, stage unchanged.
+  return { action: { kind: 'none', reason: `no TP crossing (stage ${stage})`, rule: ruleBase }, newStage: stage };
 }
